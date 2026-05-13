@@ -1,0 +1,17 @@
+[package]
+name = "skooda-utils"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "skooda_utils"
+path = "src/lib.rs"
+
+[dependencies]
+nix = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+walkdir = { workspace = true }
