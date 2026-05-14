@@ -86,6 +86,7 @@ cat <<EOF > "$BUILD_DIR/etc/services.toml"
 [[services]]
 name = "network"
 command = "/bin/skooda-net"
+args = ["daemon"]
 restart_policy = "OnFailure"
 
 [[services]]

@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::fs;
 use skooda_utils::error::{Result, SkoodaError};
-use tracing::info;
+use tracing::{info, warn, error};
 use crate::config::WifiConfig;
 
 pub struct WifiManager {
@@ -17,6 +17,8 @@ impl WifiManager {
     pub async fn run_loop(&self) {
         info!("[wifi] Starting WiFi manager for {}...", self.interface);
         
+        self.ensure_supplicant_running();
+
         loop {
             if !self.is_connected() {
                 info!("[wifi] Not connected, scanning...");
@@ -34,7 +36,34 @@ impl WifiManager {
         }
     }
 
-    fn is_connected(&self) -> bool {
+    pub fn ensure_supplicant_running(&self) {
+        let status = Command::new("/bin/wpa_cli")
+            .args(["-i", &self.interface, "ping"])
+            .output();
+
+        let running = if let Ok(out) = status {
+            String::from_utf8_lossy(&out.stdout).contains("PONG")
+        } else {
+            false
+        };
+
+        if !running {
+            info!("[wifi] Starting wpa_supplicant for {}", self.interface);
+            
+            // Ensure config exists
+            if !std::path::Path::new("/etc/wpa_supplicant.conf").exists() {
+                let _ = fs::write("/etc/wpa_supplicant.conf", "ctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\n");
+            }
+
+            let _ = Command::new("/bin/wpa_supplicant")
+                .args(["-B", "-i", &self.interface, "-c", "/etc/wpa_supplicant.conf", "-D", "nl80211"])
+                .status();
+                
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
         let output = Command::new("/bin/wpa_cli")
             .args(["-i", &self.interface, "status"])
             .output();
@@ -46,7 +75,9 @@ impl WifiManager {
         false
     }
 
-    fn scan(&self) -> Result<Vec<String>> {
+    pub fn scan(&self) -> Result<Vec<String>> {
+        self.ensure_supplicant_running();
+        
         let _ = Command::new("/bin/wpa_cli").args(["-i", &self.interface, "scan"]).status();
         std::thread::sleep(std::time::Duration::from_secs(2));
         
@@ -67,27 +98,38 @@ impl WifiManager {
     }
 
     pub async fn connect(&self, ssid: &str, psk: &str) -> Result<()> {
-        let conf = format!(
-            "ctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\n\nnetwork={{\n    ssid=\"{}\"\n    psk=\"{}\"\n}}\n",
-            ssid, psk
-        );
-        
-        fs::write("/etc/wpa_supplicant.conf", conf).map_err(|e| SkoodaError::Io {
-            path: "/etc/wpa_supplicant.conf".into(),
-            source: e,
-        })?;
+        self.ensure_supplicant_running();
 
-        let _ = Command::new("/bin/wpa_cli").args(["terminate"]).status();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let status = Command::new("/bin/wpa_supplicant")
-            .args(["-B", "-i", &self.interface, "-c", "/etc/wpa_supplicant.conf", "-D", "nl80211"])
-            .status()
-            .map_err(|e| SkoodaError::System(format!("Failed to start wpa_supplicant: {}", e)))?;
-
-        if !status.success() {
-            return Err(SkoodaError::Network("wpa_supplicant failed to start".into()));
+        // 1. Add network
+        let add_out = Command::new("/bin/wpa_cli")
+            .args(["-i", &self.interface, "add_network"])
+            .output()
+            .map_err(|e| SkoodaError::System(format!("wpa_cli add_network failed: {}", e)))?;
+            
+        let net_id = String::from_utf8_lossy(&add_out.stdout).trim().to_string();
+        if net_id.is_empty() || net_id.contains("FAIL") {
+            return Err(SkoodaError::Network(format!("Failed to add network: {}", net_id)));
         }
+
+        // 2. Set SSID
+        let _ = Command::new("/bin/wpa_cli")
+            .args(["-i", &self.interface, "set_network", &net_id, "ssid", &format!("\"{}\"", ssid)])
+            .status();
+
+        // 3. Set PSK
+        let _ = Command::new("/bin/wpa_cli")
+            .args(["-i", &self.interface, "set_network", &net_id, "psk", &format!("\"{}\"", psk)])
+            .status();
+
+        // 4. Enable network
+        let _ = Command::new("/bin/wpa_cli")
+            .args(["-i", &self.interface, "enable_network", &net_id])
+            .status();
+
+        // 5. Save config
+        let _ = Command::new("/bin/wpa_cli")
+            .args(["-i", &self.interface, "save_config"])
+            .status();
 
         Ok(())
     }
